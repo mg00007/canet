@@ -31,6 +31,7 @@ if errorlevel 1 exit /b 1
     --collect-all edge_tts ^
     --collect-all faster_whisper ^
     --collect-all huggingface_hub ^
+    --collect-all spellchecker ^
     --collect-all sounddevice ^
     --collect-all tokenizers ^
     --collect-all websockets ^

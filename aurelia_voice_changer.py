@@ -1,6 +1,7 @@
 import asyncio
 import io
 import queue
+import re
 import threading
 import time
 import tkinter as tk
@@ -11,6 +12,7 @@ import edge_tts
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
+from spellchecker import SpellChecker
 
 
 VOICE = "pt-BR-FranciscaNeural"
@@ -19,6 +21,18 @@ VOICE_OPTIONS = {
     "Thalita (pt-BR)": "pt-BR-ThalitaMultilingualNeural",
 }
 DEFAULT_HOTWORDS = "Francisca, Francisca Neural, AURELIA"
+WORD_PATTERN = re.compile(r"[^\W\d_]+", re.UNICODE)
+PT_BR_DIACRITIC_FIXES = {
+    "ola": "olá",
+    "voce": "você",
+    "voces": "vocês",
+    "nao": "não",
+    "tambem": "também",
+    "portugues": "português",
+    "transcricao": "transcrição",
+    "facil": "fácil",
+    "dificil": "difícil",
+}
 SAMPLE_RATE = 16000
 OUTPUT_RATE = 24000
 LIVE_PAUSE_SECONDS = 0.30
@@ -36,6 +50,8 @@ class VoiceChanger:
         self.events = queue.Queue()
         self.model = None
         self.model_lock = threading.Lock()
+        self.spellchecker = SpellChecker(language="pt")
+        self.spell_lock = threading.Lock()
         self.stream = None
         self.live_input_queue = None
         self.live_phrase_queue = None
@@ -67,7 +83,14 @@ class VoiceChanger:
         style.configure("TButton", padding=(12, 9), font=("Segoe UI", 10))
         style.configure("Accent.TButton", background="#c5a464", foreground="#17150f", font=("Segoe UI", 11, "bold"))
         style.map("Accent.TButton", background=[("active", "#ddbd7a"), ("disabled", "#62583e")])
-        style.configure("TCombobox", fieldbackground="#24251f", background="#24251f", foreground="#eee9dc", padding=6)
+        style.configure("TCombobox", fieldbackground="#fffdf6", background="#fffdf6", foreground="#000000", padding=6)
+        style.map(
+            "TCombobox",
+            fieldbackground=[("readonly", "#fffdf6")],
+            foreground=[("readonly", "#000000")],
+        )
+        self.root.option_add("*TCombobox*Listbox.foreground", "#000000")
+        self.root.option_add("*TCombobox*Listbox.background", "#fffdf6")
 
     def _build_ui(self):
         outer = ttk.Frame(self.root, padding=24)
@@ -119,7 +142,7 @@ class VoiceChanger:
         self.timer_var = tk.StringVar(value="Fale normalmente; frases são convertidas após uma pausa curta")
         ttk.Label(controls, textvariable=self.timer_var, style="Muted.TLabel").pack(side="left", padx=14)
 
-        ttk.Label(outer, text="Transcrição reconhecida").pack(anchor="w", pady=(8, 6))
+        ttk.Label(outer, text="Texto para falar (ditado ou digitado)").pack(anchor="w", pady=(8, 6))
         self.transcript = tk.Text(
             outer, height=8, wrap="word", undo=True, bg="#1b1c18", fg="#f0ecdf",
             insertbackground="#e7c985", relief="flat", padx=12, pady=12, font=("Segoe UI", 11),
@@ -127,12 +150,12 @@ class VoiceChanger:
         self.transcript.pack(fill="both", expand=True)
 
         self.generate_button = ttk.Button(
-            outer, text="Enviar texto editado à voz", style="Accent.TButton", command=self.generate_voice
+            outer, text="Corrigir e reproduzir com a voz selecionada", style="Accent.TButton", command=self.generate_voice
         )
         self.generate_button.pack(anchor="e", pady=(14, 10))
         ttk.Label(
             outer,
-            text="O modo ao vivo converte cada frase após uma pausa curta. A transcrição é local; o texto reconhecido é enviado ao Microsoft Edge TTS. O áudio original do microfone não é enviado.",
+            text="A correção ortográfica local ajusta palavras fora do dicionário antes de falar. Revise nomes e acentos: ela não entende o contexto da frase.",
             style="Muted.TLabel", wraplength=650,
         ).pack(anchor="w", pady=(0, 10))
         self.status_var = tk.StringVar(value="Pronto. Selecione o microfone e a saída.")
@@ -217,7 +240,7 @@ class VoiceChanger:
             self.generate_button.configure(state="disabled")
             self.transcript.configure(state="normal")
             self.transcript.delete("1.0", "end")
-            self.status_var.set("Ouvindo. A conversão para Francisca acontece automaticamente entre frases.")
+            self.status_var.set("Ouvindo. As frases serão reproduzidas pela voz selecionada.")
             self._update_timer()
         except Exception as error:
             self.stream = None
@@ -325,6 +348,7 @@ class VoiceChanger:
                     text = " ".join(segment.text.strip() for segment in segments).strip()
                     if not text:
                         continue
+                    text = self._correct_portuguese(text, hotwords)
                     self.events.put(("live_transcript", text))
                     self.events.put(("live_status", "Gerando a voz selecionada…"))
                     speech_audio = self._create_speech_samples(text, voice_id)
@@ -341,6 +365,31 @@ class VoiceChanger:
             if self.model is None:
                 self.model = WhisperModel("base", device="cpu", compute_type="int8")
             return self.model
+
+    def _correct_portuguese(self, text, extra_hotwords=None):
+        protected = {"francisca", "thalita", "aurelia", "brasil"}
+        hotwords = extra_hotwords if extra_hotwords is not None else self.hotwords_var.get()
+        protected.update(word.strip().casefold() for word in hotwords.split(",") if word.strip())
+
+        def replace_word(match):
+            word = match.group(0)
+            normalized = word.casefold()
+            if normalized in protected or normalized in self.spellchecker:
+                suggestion = PT_BR_DIACRITIC_FIXES.get(normalized)
+                if not suggestion:
+                    return word
+            else:
+                suggestion = self.spellchecker.correction(normalized)
+            if not suggestion:
+                return word
+            if word.isupper():
+                return suggestion.upper()
+            if word.istitle():
+                return suggestion.capitalize()
+            return suggestion
+
+        with self.spell_lock:
+            return WORD_PATTERN.sub(replace_word, text)
 
     def _warm_model(self):
         try:
@@ -362,11 +411,17 @@ class VoiceChanger:
             return
         output_device = self.output_devices[output_name]
         voice_id = VOICE_OPTIONS.get(self.voice_var.get(), VOICE)
+        corrected_text = self._correct_portuguese(text)
+        if corrected_text != text:
+            self.transcript.delete("1.0", "end")
+            self.transcript.insert("1.0", corrected_text)
         self.busy = True
         self.generate_button.configure(state="disabled")
         self.record_button.configure(state="disabled")
-        self.status_var.set("Gerando voz neural…")
-        threading.Thread(target=self._synthesize_and_play, args=(text, output_device, voice_id), daemon=True).start()
+        self.status_var.set("Corrigindo ortografia e gerando voz…")
+        threading.Thread(
+            target=self._synthesize_and_play, args=(corrected_text, output_device, voice_id), daemon=True
+        ).start()
 
     def _synthesize_and_play(self, text, output_device, voice_id=VOICE):
         try:

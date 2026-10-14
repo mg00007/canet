@@ -2,4 +2,5 @@ edge-tts>=7.3.1,<8
 av>=18,<19
 faster-whisper>=1.1.0,<2
 numpy>=1.26,<3
+pyspellchecker>=0.9,<1
 sounddevice>=0.5.0,<1
