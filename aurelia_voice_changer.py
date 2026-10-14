@@ -14,6 +14,14 @@ from faster_whisper import WhisperModel
 
 
 VOICE = "pt-BR-FranciscaNeural"
+VOICE_OPTIONS = {
+    "Francisca (pt-BR)": "pt-BR-FranciscaNeural",
+    "Thalita (pt-BR)": "pt-BR-ThalitaMultilingualNeural",
+    "Raquel (pt-PT)": "pt-PT-RaquelNeural",
+    "Ava Multilingual (en-US)": "en-US-AvaMultilingualNeural",
+    "Emma Multilingual (en-US)": "en-US-EmmaMultilingualNeural",
+}
+DEFAULT_HOTWORDS = "Francisca, Francisca Neural, AURELIA"
 SAMPLE_RATE = 16000
 OUTPUT_RATE = 24000
 LIVE_PAUSE_SECONDS = 0.30
@@ -24,8 +32,8 @@ class VoiceChanger:
     def __init__(self, root):
         self.root = root
         self.root.title("AURELIA | Voz Neural")
-        self.root.geometry("720x720")
-        self.root.minsize(620, 640)
+        self.root.geometry("760x800")
+        self.root.minsize(640, 700)
         self.root.configure(bg="#111310")
 
         self.events = queue.Queue()
@@ -71,7 +79,7 @@ class VoiceChanger:
         ttk.Label(outer, text="AURELIA", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             outer,
-            text="Fale ao microfone. Sua mensagem será sintetizada com a voz pt-BR-FranciscaNeural.",
+            text="Fale ao microfone. A fala será reconhecida e reproduzida pela voz escolhida.",
             style="Muted.TLabel", wraplength=650,
         ).pack(anchor="w", pady=(3, 18))
 
@@ -86,13 +94,22 @@ class VoiceChanger:
         self.output_var = tk.StringVar()
         self.output_menu = ttk.Combobox(devices, textvariable=self.output_var, state="readonly")
         self.output_menu.grid(row=1, column=1, sticky="ew", pady=6)
+        ttk.Label(devices, text="Voz sintetizada").grid(row=2, column=0, sticky="w", padx=(0, 12), pady=6)
+        self.voice_var = tk.StringVar(value="Francisca (pt-BR)")
+        self.voice_menu = ttk.Combobox(
+            devices, textvariable=self.voice_var, values=list(VOICE_OPTIONS), state="readonly"
+        )
+        self.voice_menu.grid(row=2, column=1, sticky="ew", pady=6)
+        ttk.Label(devices, text="Nomes para reconhecer").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=6)
+        self.hotwords_var = tk.StringVar(value=DEFAULT_HOTWORDS)
+        ttk.Entry(devices, textvariable=self.hotwords_var).grid(row=3, column=1, sticky="ew", pady=6)
         ttk.Button(devices, text="Atualizar dispositivos", command=self.refresh_devices).grid(
-            row=2, column=1, sticky="e", pady=(8, 0)
+            row=4, column=1, sticky="e", pady=(8, 0)
         )
 
         ttk.Label(
             outer,
-            text="Para usar em uma chamada: selecione CABLE Input como saída aqui e CABLE Output como microfone no aplicativo da chamada.",
+            text="Thalita é pt-BR; Raquel é pt-PT. Ava e Emma são multilíngues en-US e podem soar com sotaque diferente. Para chamadas, escolha CABLE Input aqui e CABLE Output no app da chamada.",
             style="Muted.TLabel", wraplength=650,
         ).pack(anchor="w", pady=(0, 16))
 
@@ -175,6 +192,8 @@ class VoiceChanger:
         if output_name not in self.output_devices:
             self.status_var.set("Selecione uma saída de áudio disponível.")
             return
+        voice_id = VOICE_OPTIONS.get(self.voice_var.get(), VOICE)
+        hotwords = self.hotwords_var.get().strip()
         self.live_input_queue = queue.Queue()
         self.live_phrase_queue = queue.Queue()
         self.record_started = time.monotonic()
@@ -194,7 +213,7 @@ class VoiceChanger:
             ).start()
             threading.Thread(
                 target=self._process_live_phrases,
-                args=(self.live_phrase_queue, output_device),
+                args=(self.live_phrase_queue, output_device, voice_id, hotwords),
                 daemon=True,
             ).start()
             self.record_button.configure(text="Parar conversão ao vivo")
@@ -290,7 +309,7 @@ class VoiceChanger:
                 phrase_samples = 0
                 active = False
 
-    def _process_live_phrases(self, phrase_queue, output_device):
+    def _process_live_phrases(self, phrase_queue, output_device, voice_id=VOICE, hotwords=DEFAULT_HOTWORDS):
         try:
             while True:
                 audio = phrase_queue.get()
@@ -304,14 +323,14 @@ class VoiceChanger:
                         vad_filter=True,
                         beam_size=1,
                         condition_on_previous_text=False,
-                        hotwords="Francisca, Francisca Neural, AURELIA",
+                        hotwords=hotwords or None,
                     )
                     text = " ".join(segment.text.strip() for segment in segments).strip()
                     if not text:
                         continue
                     self.events.put(("live_transcript", text))
-                    self.events.put(("live_status", "Gerando a voz Francisca…"))
-                    speech_audio = self._create_speech_samples(text)
+                    self.events.put(("live_status", "Gerando a voz selecionada…"))
+                    speech_audio = self._create_speech_samples(text, voice_id)
                     sd.play(speech_audio, samplerate=OUTPUT_RATE, device=output_device, blocking=True)
                     if self.live_mode:
                         self.events.put(("live_status", "Ouvindo a próxima frase…"))
@@ -345,25 +364,26 @@ class VoiceChanger:
             self.status_var.set("Selecione uma saída de áudio disponível.")
             return
         output_device = self.output_devices[output_name]
+        voice_id = VOICE_OPTIONS.get(self.voice_var.get(), VOICE)
         self.busy = True
         self.generate_button.configure(state="disabled")
         self.record_button.configure(state="disabled")
         self.status_var.set("Gerando voz neural…")
-        threading.Thread(target=self._synthesize_and_play, args=(text, output_device), daemon=True).start()
+        threading.Thread(target=self._synthesize_and_play, args=(text, output_device, voice_id), daemon=True).start()
 
-    def _synthesize_and_play(self, text, output_device):
+    def _synthesize_and_play(self, text, output_device, voice_id=VOICE):
         try:
-            audio = self._create_speech_samples(text)
+            audio = self._create_speech_samples(text, voice_id)
             self.events.put(("status", "Reproduzindo pela saída selecionada…"))
             sd.play(audio, samplerate=OUTPUT_RATE, device=output_device, blocking=True)
             self.events.put(("done", None))
         except Exception as error:
             self.events.put(("error", f"Falha ao gerar ou reproduzir a voz: {error}"))
 
-    def _create_speech_samples(self, text):
+    def _create_speech_samples(self, text, voice_id=VOICE):
         async def generate_audio():
             chunks = []
-            speech = edge_tts.Communicate(text, VOICE, rate="-8%", pitch="-1Hz")
+            speech = edge_tts.Communicate(text, voice_id, rate="-8%", pitch="-1Hz")
             async for message in speech.stream():
                 if message["type"] == "audio":
                     chunks.append(message["data"])
