@@ -1,11 +1,16 @@
 import asyncio
 import io
+import json
+import os
 import queue
 import re
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk
+import webbrowser
+from urllib import error as url_error
+from urllib import request as url_request
 
 import av
 import edge_tts
@@ -21,6 +26,12 @@ VOICE_OPTIONS = {
     "Thalita (pt-BR)": "pt-BR-ThalitaMultilingualNeural",
 }
 DEFAULT_HOTWORDS = "Francisca, Francisca Neural, AURELIA"
+DEFAULT_AI_MODEL = "gpt-4o-mini"
+AI_SYSTEM_PROMPT = (
+    "Você é uma assistente de conversação. Responda sempre em português brasileiro natural, "
+    "com clareza e de forma concisa. Responda ao que a pessoa disse ou perguntou. "
+    "Não afirme ser humana nem invente fatos quando não souber."
+)
 WORD_PATTERN = re.compile(r"[^\W\d_]+", re.UNICODE)
 PT_BR_DIACRITIC_FIXES = {
     "ola": "olá",
@@ -43,8 +54,8 @@ class VoiceChanger:
     def __init__(self, root):
         self.root = root
         self.root.title("AURELIA | Voz Neural")
-        self.root.geometry("760x800")
-        self.root.minsize(640, 700)
+        self.root.geometry("760x880")
+        self.root.minsize(640, 740)
         self.root.configure(bg="#111310")
 
         self.events = queue.Queue()
@@ -52,6 +63,8 @@ class VoiceChanger:
         self.model_lock = threading.Lock()
         self.spellchecker = SpellChecker(language="pt")
         self.spell_lock = threading.Lock()
+        self.ai_history = []
+        self.ai_lock = threading.Lock()
         self.stream = None
         self.live_input_queue = None
         self.live_phrase_queue = None
@@ -99,7 +112,7 @@ class VoiceChanger:
         ttk.Label(outer, text="AURELIA", style="Title.TLabel").pack(anchor="w")
         ttk.Label(
             outer,
-            text="Fale ao microfone. A fala será reconhecida e reproduzida pela voz escolhida.",
+            text="Fale ou digite uma pergunta; a IA responde pela voz selecionada.",
             style="Muted.TLabel", wraplength=650,
         ).pack(anchor="w", pady=(3, 18))
 
@@ -123,13 +136,23 @@ class VoiceChanger:
         ttk.Label(devices, text="Nomes para reconhecer").grid(row=3, column=0, sticky="w", padx=(0, 12), pady=6)
         self.hotwords_var = tk.StringVar(value=DEFAULT_HOTWORDS)
         ttk.Entry(devices, textvariable=self.hotwords_var).grid(row=3, column=1, sticky="ew", pady=6)
+        ttk.Label(devices, text="Chave OpenAI (sessão atual)").grid(
+            row=4, column=0, sticky="w", padx=(0, 12), pady=6
+        )
+        self.api_key_var = tk.StringVar(value=os.environ.get("OPENAI_API_KEY", ""))
+        ttk.Entry(devices, textvariable=self.api_key_var, show="*").grid(
+            row=4, column=1, sticky="ew", pady=6
+        )
+        ttk.Label(devices, text="Microfone virtual").grid(row=5, column=0, sticky="w", padx=(0, 12), pady=6)
+        self.virtual_device_var = tk.StringVar(value="Verificando dispositivos…")
+        ttk.Label(devices, textvariable=self.virtual_device_var).grid(row=5, column=1, sticky="w", pady=6)
         ttk.Button(devices, text="Atualizar dispositivos", command=self.refresh_devices).grid(
-            row=4, column=1, sticky="e", pady=(8, 0)
+            row=6, column=1, sticky="e", pady=(8, 0)
         )
 
         ttk.Label(
             outer,
-            text="A transcrição é fixada em português. As duas vozes disponíveis são pt-BR. Para chamadas, escolha CABLE Input aqui e CABLE Output no app da chamada.",
+            text="A IA responde em português brasileiro pela voz selecionada. Instale o VB-CABLE para enviar a resposta como microfone virtual.",
             style="Muted.TLabel", wraplength=650,
         ).pack(anchor="w", pady=(0, 16))
 
@@ -142,20 +165,36 @@ class VoiceChanger:
         self.timer_var = tk.StringVar(value="Fale normalmente; frases são convertidas após uma pausa curta")
         ttk.Label(controls, textvariable=self.timer_var, style="Muted.TLabel").pack(side="left", padx=14)
 
-        ttk.Label(outer, text="Texto para falar (ditado ou digitado)").pack(anchor="w", pady=(8, 6))
+        ttk.Label(outer, text="Conversa").pack(anchor="w", pady=(8, 6))
         self.transcript = tk.Text(
-            outer, height=8, wrap="word", undo=True, bg="#1b1c18", fg="#f0ecdf",
+            outer, height=6, wrap="word", undo=True, bg="#1b1c18", fg="#f0ecdf",
             insertbackground="#e7c985", relief="flat", padx=12, pady=12, font=("Segoe UI", 11),
         )
         self.transcript.pack(fill="both", expand=True)
-
-        self.generate_button = ttk.Button(
-            outer, text="Corrigir e reproduzir com a voz selecionada", style="Accent.TButton", command=self.generate_voice
+        ttk.Label(outer, text="Texto ou pergunta").pack(anchor="w", pady=(10, 6))
+        self.user_input = tk.Text(
+            outer, height=3, wrap="word", undo=True, bg="#1b1c18", fg="#f0ecdf",
+            insertbackground="#e7c985", relief="flat", padx=12, pady=12, font=("Segoe UI", 11),
         )
-        self.generate_button.pack(anchor="e", pady=(14, 10))
+        self.user_input.pack(fill="x")
+
+        actions = ttk.Frame(outer)
+        actions.pack(fill="x", pady=(14, 10))
+        self.generate_button = ttk.Button(actions, text="Falar texto digitado", command=self.generate_voice)
+        self.generate_button.pack(side="left")
+        ttk.Button(actions, text="Obter VB-CABLE", command=self.open_virtual_device_download).pack(
+            side="right", padx=8
+        )
+        self.ask_button = ttk.Button(
+            actions,
+            text="Perguntar à IA e falar a resposta",
+            style="Accent.TButton",
+            command=self.ask_ai_from_text,
+        )
+        self.ask_button.pack(side="right")
         ttk.Label(
             outer,
-            text="A correção ortográfica local ajusta palavras fora do dicionário antes de falar. Revise nomes e acentos: ela não entende o contexto da frase.",
+            text="Transcrições e perguntas digitadas são enviadas à OpenAI. A chave não é salva; o uso da API pode ser cobrado. A resposta vai ao Microsoft Edge TTS.",
             style="Muted.TLabel", wraplength=650,
         ).pack(anchor="w", pady=(0, 10))
         self.status_var = tk.StringVar(value="Pronto. Selecione o microfone e a saída.")
@@ -179,6 +218,12 @@ class VoiceChanger:
             output_names = list(self.output_devices)
             self.input_menu["values"] = input_names
             self.output_menu["values"] = output_names
+            virtual_input = next((name for name in input_names if "cable output" in name.lower()), None)
+            virtual_output = next((name for name in output_names if "cable input" in name.lower()), None)
+            if virtual_input and virtual_output:
+                self.virtual_device_var.set("Pronto: CABLE Input → CABLE Output")
+            else:
+                self.virtual_device_var.set("Não instalado; use Obter VB-CABLE e reinicie o Windows")
             if input_names:
                 selected = next(
                     (name for name, index in self.input_devices.items() if index == default_input), input_names[0]
@@ -194,6 +239,9 @@ class VoiceChanger:
                     self.status_var.set("VB-CABLE não encontrado. Instale-o para enviar a voz a outros aplicativos.")
         except Exception as error:
             self.status_var.set(f"Não foi possível consultar o áudio: {error}")
+
+    def open_virtual_device_download(self):
+        webbrowser.open("https://vb-audio.com/Cable/")
 
     def toggle_recording(self):
         if self.busy:
@@ -214,6 +262,10 @@ class VoiceChanger:
             return
         voice_id = VOICE_OPTIONS.get(self.voice_var.get(), VOICE)
         hotwords = self.hotwords_var.get().strip()
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            self.status_var.set("Informe uma chave OpenAI para iniciar a conversa por voz.")
+            return
         self.live_input_queue = queue.Queue()
         self.live_phrase_queue = queue.Queue()
         self.record_started = time.monotonic()
@@ -233,11 +285,12 @@ class VoiceChanger:
             ).start()
             threading.Thread(
                 target=self._process_live_phrases,
-                args=(self.live_phrase_queue, output_device, voice_id, hotwords),
+                args=(self.live_phrase_queue, output_device, voice_id, hotwords, api_key),
                 daemon=True,
             ).start()
             self.record_button.configure(text="Parar conversão ao vivo")
             self.generate_button.configure(state="disabled")
+            self.ask_button.configure(state="disabled")
             self.transcript.configure(state="normal")
             self.transcript.delete("1.0", "end")
             self.status_var.set("Ouvindo. As frases serão reproduzidas pela voz selecionada.")
@@ -267,6 +320,7 @@ class VoiceChanger:
         if stream is not None:
             stream.stop()
             stream.close()
+        self.busy = True
         self.live_mode = False
         if self.live_input_queue is not None:
             self.live_input_queue.put(None)
@@ -329,7 +383,9 @@ class VoiceChanger:
                 phrase_samples = 0
                 active = False
 
-    def _process_live_phrases(self, phrase_queue, output_device, voice_id=VOICE, hotwords=DEFAULT_HOTWORDS):
+    def _process_live_phrases(
+        self, phrase_queue, output_device, voice_id=VOICE, hotwords=DEFAULT_HOTWORDS, api_key=""
+    ):
         try:
             while True:
                 audio = phrase_queue.get()
@@ -349,9 +405,11 @@ class VoiceChanger:
                     if not text:
                         continue
                     text = self._correct_portuguese(text, hotwords)
-                    self.events.put(("live_transcript", text))
-                    self.events.put(("live_status", "Gerando a voz selecionada…"))
-                    speech_audio = self._create_speech_samples(text, voice_id)
+                    self.events.put(("live_status", "Consultando a IA…"))
+                    answer = self._ask_ai(text, api_key)
+                    self.events.put(("assistant_exchange", (text, answer)))
+                    self.events.put(("live_status", "Falando a resposta…"))
+                    speech_audio = self._create_speech_samples(answer, voice_id)
                     sd.play(speech_audio, samplerate=OUTPUT_RATE, device=output_device, blocking=True)
                     if self.live_mode:
                         self.events.put(("live_status", "Ouvindo a próxima frase…"))
@@ -391,6 +449,47 @@ class VoiceChanger:
         with self.spell_lock:
             return WORD_PATTERN.sub(replace_word, text)
 
+    def _ask_ai(self, text, api_key):
+        if not api_key:
+            raise RuntimeError("Informe uma chave OpenAI válida.")
+        with self.ai_lock:
+            messages = [{"role": "system", "content": AI_SYSTEM_PROMPT}, *self.ai_history[-10:]]
+        messages.append({"role": "user", "content": text})
+        payload = json.dumps({
+            "model": DEFAULT_AI_MODEL,
+            "messages": messages,
+            "temperature": 0.5,
+            "max_tokens": 220,
+        }).encode("utf-8")
+        request = url_request.Request(
+            "https://api.openai.com/v1/chat/completions",
+            data=payload,
+            headers={
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        try:
+            with url_request.urlopen(request, timeout=30) as response:
+                result = json.loads(response.read().decode("utf-8"))
+        except url_error.HTTPError as error:
+            detail = error.read().decode("utf-8", errors="replace")[:400]
+            raise RuntimeError(f"OpenAI retornou HTTP {error.code}: {detail}") from error
+        except url_error.URLError as error:
+            raise RuntimeError(f"Não foi possível conectar à OpenAI: {error.reason}") from error
+
+        answer = result.get("choices", [{}])[0].get("message", {}).get("content", "").strip()
+        if not answer:
+            raise RuntimeError("A IA não retornou uma resposta em texto.")
+        with self.ai_lock:
+            self.ai_history.extend((
+                {"role": "user", "content": text},
+                {"role": "assistant", "content": answer},
+            ))
+            self.ai_history = self.ai_history[-10:]
+        return answer
+
     def _warm_model(self):
         try:
             self._get_model()
@@ -401,9 +500,9 @@ class VoiceChanger:
     def generate_voice(self):
         if self.busy or self.recording:
             return
-        text = self.transcript.get("1.0", "end-1c").strip()
+        text = self.user_input.get("1.0", "end-1c").strip()
         if not text:
-            self.status_var.set("Grave uma frase ou digite o texto que deseja sintetizar.")
+            self.status_var.set("Digite o texto que deseja sintetizar.")
             return
         output_name = self.output_var.get()
         if output_name not in self.output_devices:
@@ -413,15 +512,58 @@ class VoiceChanger:
         voice_id = VOICE_OPTIONS.get(self.voice_var.get(), VOICE)
         corrected_text = self._correct_portuguese(text)
         if corrected_text != text:
-            self.transcript.delete("1.0", "end")
-            self.transcript.insert("1.0", corrected_text)
+            self.user_input.delete("1.0", "end")
+            self.user_input.insert("1.0", corrected_text)
         self.busy = True
         self.generate_button.configure(state="disabled")
+        self.ask_button.configure(state="disabled")
         self.record_button.configure(state="disabled")
         self.status_var.set("Corrigindo ortografia e gerando voz…")
         threading.Thread(
             target=self._synthesize_and_play, args=(corrected_text, output_device, voice_id), daemon=True
         ).start()
+
+    def ask_ai_from_text(self):
+        if self.busy or self.recording:
+            return
+        text = self.user_input.get("1.0", "end-1c").strip()
+        if not text:
+            self.status_var.set("Digite uma pergunta ou frase para a IA.")
+            return
+        api_key = self.api_key_var.get().strip()
+        if not api_key:
+            self.status_var.set("Informe uma chave OpenAI para perguntar à IA.")
+            return
+        output_name = self.output_var.get()
+        if output_name not in self.output_devices:
+            self.status_var.set("Selecione uma saída de áudio disponível.")
+            return
+        corrected_text = self._correct_portuguese(text)
+        if corrected_text != text:
+            self.user_input.delete("1.0", "end")
+            self.user_input.insert("1.0", corrected_text)
+        voice_id = VOICE_OPTIONS.get(self.voice_var.get(), VOICE)
+        self.busy = True
+        self.ask_button.configure(state="disabled")
+        self.generate_button.configure(state="disabled")
+        self.record_button.configure(state="disabled")
+        self.user_input.delete("1.0", "end")
+        self.status_var.set("Consultando a IA…")
+        threading.Thread(
+            target=self._answer_and_play,
+            args=(corrected_text, self.output_devices[output_name], voice_id, api_key),
+            daemon=True,
+        ).start()
+
+    def _answer_and_play(self, text, output_device, voice_id, api_key):
+        try:
+            answer = self._ask_ai(text, api_key)
+            self.events.put(("assistant_exchange", (text, answer)))
+            audio = self._create_speech_samples(answer, voice_id)
+            sd.play(audio, samplerate=OUTPUT_RATE, device=output_device, blocking=True)
+            self.events.put(("done", None))
+        except Exception as error:
+            self.events.put(("error", f"Falha ao consultar a IA ou falar a resposta: {error}"))
 
     def _synthesize_and_play(self, text, output_device, voice_id=VOICE):
         try:
@@ -469,6 +611,11 @@ class VoiceChanger:
                     self.transcript.configure(state="normal")
                     self.transcript.insert("end", value + "\n")
                     self.transcript.see("end")
+                elif event == "assistant_exchange":
+                    user_text, answer = value
+                    self.transcript.configure(state="normal")
+                    self.transcript.insert("end", f"Você: {user_text}\nAURELIA: {answer}\n\n")
+                    self.transcript.see("end")
                 elif event == "live_error":
                     self.status_var.set(value)
                 elif event == "model_ready":
@@ -479,7 +626,9 @@ class VoiceChanger:
                     self.status_var.set(value)
                 elif event == "live_finished":
                     self.timer_var.set("Fale normalmente; frases são convertidas após uma pausa curta")
+                    self.busy = False
                     self.generate_button.configure(state="normal")
+                    self.ask_button.configure(state="normal")
                     if not self.recording:
                         self.status_var.set("Conversão ao vivo encerrada.")
                 elif event == "transcript":
@@ -500,6 +649,8 @@ class VoiceChanger:
                     self.busy = False
                 if not self.busy:
                     self.generate_button.configure(state="normal")
+                    if not self.recording:
+                        self.ask_button.configure(state="normal")
                     self.record_button.configure(state="normal")
         except queue.Empty:
             pass
