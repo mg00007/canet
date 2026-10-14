@@ -18,7 +18,8 @@ from faster_whisper import WhisperModel
 VOICE = "pt-BR-FranciscaNeural"
 SAMPLE_RATE = 16000
 OUTPUT_RATE = 24000
-MAX_RECORD_SECONDS = 25
+LIVE_PAUSE_SECONDS = 0.45
+LIVE_MAX_SEGMENT_SECONDS = 8
 
 
 class VoiceChanger:
@@ -32,9 +33,11 @@ class VoiceChanger:
         self.events = queue.Queue()
         self.model = None
         self.stream = None
-        self.audio_chunks = []
+        self.live_input_queue = None
+        self.live_phrase_queue = None
         self.recording = False
         self.busy = False
+        self.live_mode = False
         self.record_started = 0.0
         self.input_devices = {}
         self.output_devices = {}
@@ -94,13 +97,13 @@ class VoiceChanger:
         controls = ttk.Frame(outer)
         controls.pack(fill="x", pady=(0, 10))
         self.record_button = ttk.Button(
-            controls, text="Iniciar gravação", style="Accent.TButton", command=self.toggle_recording
+            controls, text="Iniciar conversão ao vivo", style="Accent.TButton", command=self.toggle_recording
         )
         self.record_button.pack(side="left")
-        self.timer_var = tk.StringVar(value=f"Até {MAX_RECORD_SECONDS} segundos por trecho")
+        self.timer_var = tk.StringVar(value="Fale normalmente; frases são convertidas após uma pausa curta")
         ttk.Label(controls, textvariable=self.timer_var, style="Muted.TLabel").pack(side="left", padx=14)
 
-        ttk.Label(outer, text="Transcrição (edite antes de sintetizar, se necessário)").pack(anchor="w", pady=(8, 6))
+        ttk.Label(outer, text="Transcrição reconhecida").pack(anchor="w", pady=(8, 6))
         self.transcript = tk.Text(
             outer, height=8, wrap="word", undo=True, bg="#1b1c18", fg="#f0ecdf",
             insertbackground="#e7c985", relief="flat", padx=12, pady=12, font=("Segoe UI", 11),
@@ -108,12 +111,12 @@ class VoiceChanger:
         self.transcript.pack(fill="both", expand=True)
 
         self.generate_button = ttk.Button(
-            outer, text="Gerar voz e enviar à saída", style="Accent.TButton", command=self.generate_voice
+            outer, text="Enviar texto editado à voz", style="Accent.TButton", command=self.generate_voice
         )
         self.generate_button.pack(anchor="e", pady=(14, 10))
         ttk.Label(
             outer,
-            text="A transcrição é feita localmente. O texto editado é enviado ao Microsoft Edge TTS para gerar a voz; o áudio original do microfone não é enviado.",
+            text="O modo ao vivo converte cada frase após uma pausa curta. A transcrição é local; o texto reconhecido é enviado ao Microsoft Edge TTS. O áudio original do microfone não é enviado.",
             style="Muted.TLabel", wraplength=650,
         ).pack(anchor="w", pady=(0, 10))
         self.status_var = tk.StringVar(value="Pronto. Selecione o microfone e a saída.")
@@ -166,17 +169,37 @@ class VoiceChanger:
         if input_name not in self.input_devices:
             self.status_var.set("Selecione um microfone disponível.")
             return
-        self.audio_chunks = []
+        output_name = self.output_var.get()
+        if output_name not in self.output_devices:
+            self.status_var.set("Selecione uma saída de áudio disponível.")
+            return
+        self.live_input_queue = queue.Queue()
+        self.live_phrase_queue = queue.Queue()
         self.record_started = time.monotonic()
         try:
             self.stream = sd.InputStream(
                 device=self.input_devices[input_name], samplerate=SAMPLE_RATE, channels=1,
-                dtype="float32", callback=self._audio_callback,
+                blocksize=1600, dtype="float32", callback=self._audio_callback,
             )
             self.stream.start()
             self.recording = True
-            self.record_button.configure(text="Parar e transcrever")
-            self.status_var.set("Gravando. Clique para parar e converter sua fala.")
+            self.live_mode = True
+            output_device = self.output_devices[output_name]
+            threading.Thread(
+                target=self._segment_live_audio,
+                args=(self.live_input_queue, self.live_phrase_queue),
+                daemon=True,
+            ).start()
+            threading.Thread(
+                target=self._process_live_phrases,
+                args=(self.live_phrase_queue, output_device),
+                daemon=True,
+            ).start()
+            self.record_button.configure(text="Parar conversão ao vivo")
+            self.generate_button.configure(state="disabled")
+            self.transcript.configure(state="normal")
+            self.transcript.delete("1.0", "end")
+            self.status_var.set("Ouvindo. A conversão para Francisca acontece automaticamente entre frases.")
             self._update_timer()
         except Exception as error:
             self.stream = None
@@ -185,16 +208,14 @@ class VoiceChanger:
     def _audio_callback(self, audio, frames, timing, status):
         if status:
             self.events.put(("status", f"Áudio: {status}"))
-        self.audio_chunks.append(audio.copy())
+        if self.live_input_queue is not None:
+            self.live_input_queue.put(audio.copy())
 
     def _update_timer(self):
         if not self.recording:
             return
         elapsed = time.monotonic() - self.record_started
-        self.timer_var.set(f"Gravando: {elapsed:04.1f} / {MAX_RECORD_SECONDS}s")
-        if elapsed >= MAX_RECORD_SECONDS:
-            self.stop_recording()
-            return
+        self.timer_var.set(f"Ao vivo: {elapsed:04.1f}s")
         self.root.after(100, self._update_timer)
 
     def stop_recording(self):
@@ -205,30 +226,94 @@ class VoiceChanger:
         if stream is not None:
             stream.stop()
             stream.close()
-        self.record_button.configure(text="Iniciar gravação")
-        self.timer_var.set("Transcrevendo localmente…")
-        if not self.audio_chunks:
-            self.timer_var.set(f"Até {MAX_RECORD_SECONDS} segundos por trecho")
-            self.status_var.set("Nenhum áudio capturado. Verifique o microfone selecionado.")
-            return
-        self.busy = True
-        audio = np.concatenate(self.audio_chunks, axis=0).reshape(-1)
-        self.audio_chunks = []
-        threading.Thread(target=self._transcribe, args=(audio,), daemon=True).start()
+        self.live_mode = False
+        if self.live_input_queue is not None:
+            self.live_input_queue.put(None)
+        self.record_button.configure(text="Iniciar conversão ao vivo")
+        self.timer_var.set("Finalizando a última frase…")
+        self.status_var.set("Parando. As frases já capturadas ainda serão convertidas.")
 
-    def _transcribe(self, audio):
-        try:
-            self.events.put(("status", "Carregando reconhecimento local; a primeira execução baixa o modelo…"))
-            if self.model is None:
-                self.model = WhisperModel("base", device="cpu", compute_type="int8")
-            segments, _ = self.model.transcribe(audio, language="pt", vad_filter=True, beam_size=3)
-            text = " ".join(segment.text.strip() for segment in segments).strip()
-            if text:
-                self.events.put(("transcript", text))
+    def _segment_live_audio(self, audio_queue, phrase_queue):
+        pre_roll = []
+        phrase = []
+        noise_floor = 0.002
+        speech_samples = 0
+        silence_samples = 0
+        phrase_samples = 0
+        active = False
+        silence_limit = int(SAMPLE_RATE * LIVE_PAUSE_SECONDS)
+        segment_limit = int(SAMPLE_RATE * LIVE_MAX_SEGMENT_SECONDS)
+
+        while True:
+            block = audio_queue.get()
+            if block is None:
+                if active and speech_samples >= int(SAMPLE_RATE * 0.25):
+                    phrase_queue.put(np.concatenate(phrase).astype(np.float32, copy=False))
+                phrase_queue.put(None)
+                return
+
+            samples = np.asarray(block, dtype=np.float32).reshape(-1)
+            rms = float(np.sqrt(np.mean(samples * samples)))
+            threshold = max(0.006, noise_floor * 3.0)
+
+            if not active:
+                if rms < threshold:
+                    noise_floor = 0.95 * noise_floor + 0.05 * rms
+                pre_roll.append(samples)
+                if len(pre_roll) > 3:
+                    pre_roll.pop(0)
+                if rms >= threshold:
+                    active = True
+                    phrase = pre_roll.copy()
+                    phrase_samples = sum(len(part) for part in phrase)
+                    speech_samples = len(samples)
+                    silence_samples = 0
+                continue
+
+            phrase.append(samples)
+            phrase_samples += len(samples)
+            if rms >= max(0.004, threshold * 0.65):
+                speech_samples += len(samples)
+                silence_samples = 0
             else:
-                self.events.put(("empty", None))
-        except Exception as error:
-            self.events.put(("error", f"Erro ao transcrever: {error}"))
+                silence_samples += len(samples)
+
+            if silence_samples >= silence_limit or phrase_samples >= segment_limit:
+                if speech_samples >= int(SAMPLE_RATE * 0.25):
+                    phrase_queue.put(np.concatenate(phrase).astype(np.float32, copy=False))
+                phrase = []
+                pre_roll = []
+                speech_samples = 0
+                silence_samples = 0
+                phrase_samples = 0
+                active = False
+
+    def _process_live_phrases(self, phrase_queue, output_device):
+        try:
+            while True:
+                audio = phrase_queue.get()
+                if audio is None:
+                    break
+                try:
+                    self.events.put(("live_status", "Reconhecendo a frase…"))
+                    if self.model is None:
+                        self.model = WhisperModel("base", device="cpu", compute_type="int8")
+                    segments, _ = self.model.transcribe(
+                        audio, language="pt", vad_filter=True, beam_size=1, condition_on_previous_text=False
+                    )
+                    text = " ".join(segment.text.strip() for segment in segments).strip()
+                    if not text:
+                        continue
+                    self.events.put(("live_transcript", text))
+                    self.events.put(("live_status", "Gerando a voz Francisca…"))
+                    speech_audio = self._create_speech_samples(text)
+                    sd.play(speech_audio, samplerate=OUTPUT_RATE, device=output_device, blocking=True)
+                    if self.live_mode:
+                        self.events.put(("live_status", "Ouvindo a próxima frase…"))
+                except Exception as error:
+                    self.events.put(("live_error", f"Falha nesta frase; a escuta continua: {error}"))
+        finally:
+            self.events.put(("live_finished", None))
 
     def generate_voice(self):
         if self.busy or self.recording:
@@ -249,6 +334,15 @@ class VoiceChanger:
         threading.Thread(target=self._synthesize_and_play, args=(text, output_device), daemon=True).start()
 
     def _synthesize_and_play(self, text, output_device):
+        try:
+            audio = self._create_speech_samples(text)
+            self.events.put(("status", "Reproduzindo pela saída selecionada…"))
+            sd.play(audio, samplerate=OUTPUT_RATE, device=output_device, blocking=True)
+            self.events.put(("done", None))
+        except Exception as error:
+            self.events.put(("error", f"Falha ao gerar ou reproduzir a voz: {error}"))
+
+    def _create_speech_samples(self, text):
         mp3_path = None
         try:
             with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temporary:
@@ -263,11 +357,7 @@ class VoiceChanger:
             audio = np.frombuffer(decoded.stdout, dtype=np.float32).copy()
             if not audio.size:
                 raise RuntimeError("O serviço de voz retornou áudio vazio.")
-            self.events.put(("status", "Reproduzindo pela saída selecionada…"))
-            sd.play(audio, samplerate=OUTPUT_RATE, device=output_device, blocking=True)
-            self.events.put(("done", None))
-        except Exception as error:
-            self.events.put(("error", f"Falha ao gerar ou reproduzir a voz: {error}"))
+            return audio
         finally:
             if mp3_path and os.path.exists(mp3_path):
                 os.unlink(mp3_path)
@@ -278,14 +368,27 @@ class VoiceChanger:
                 event, value = self.events.get_nowait()
                 if event == "status":
                     self.status_var.set(value)
+                elif event == "live_status":
+                    self.status_var.set(value)
+                elif event == "live_transcript":
+                    self.transcript.configure(state="normal")
+                    self.transcript.insert("end", value + "\n")
+                    self.transcript.see("end")
+                elif event == "live_error":
+                    self.status_var.set(value)
+                elif event == "live_finished":
+                    self.timer_var.set("Fale normalmente; frases são convertidas após uma pausa curta")
+                    self.generate_button.configure(state="normal")
+                    if not self.recording:
+                        self.status_var.set("Conversão ao vivo encerrada.")
                 elif event == "transcript":
                     self.transcript.delete("1.0", "end")
                     self.transcript.insert("1.0", value)
-                    self.timer_var.set(f"Até {MAX_RECORD_SECONDS} segundos por trecho")
+                    self.timer_var.set("Transcrição pronta")
                     self.status_var.set("Transcrição pronta. Corrija o texto e gere a voz na saída escolhida.")
                     self.busy = False
                 elif event == "empty":
-                    self.timer_var.set(f"Até {MAX_RECORD_SECONDS} segundos por trecho")
+                    self.timer_var.set("Pronto")
                     self.status_var.set("Não reconheci fala neste trecho. Tente novamente ou digite o texto.")
                     self.busy = False
                 elif event == "error":
