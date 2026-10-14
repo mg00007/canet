@@ -1,0 +1,41 @@
+name: Build AURELIA Voice for Windows
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - "aurelia_voice_changer.py"
+      - "build_windows.bat"
+      - "voice_changer_*.txt"
+      - ".github/workflows/build-windows-voice.yml"
+
+jobs:
+  build:
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          architecture: x64
+      - name: Build Windows package
+        shell: cmd
+        run: build_windows.bat
+      - uses: actions/upload-artifact@v4
+        with:
+          name: AURELIA-Voice-Windows
+          path: AURELIA_Voice_Windows.zip
+          if-no-files-found: error
+          retention-days: 14
+      - name: Publish Windows download
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "aurelia-voice-${{ github.run_number }}"
+          AURELIA_Voice_Windows.zip
+          --repo "${{ github.repository }}"
+          --title "AURELIA Voz para Windows"
+          --notes "Aplicativo Windows x64 de voz neural. Consulte README_VOZ_WINDOWS.md para instalação e uso."

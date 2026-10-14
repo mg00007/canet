@@ -1,0 +1,2 @@
+-r voice_changer_requirements.txt
+pyinstaller>=6.10,<7
