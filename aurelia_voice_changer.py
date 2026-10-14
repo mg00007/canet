@@ -17,9 +17,6 @@ VOICE = "pt-BR-FranciscaNeural"
 VOICE_OPTIONS = {
     "Francisca (pt-BR)": "pt-BR-FranciscaNeural",
     "Thalita (pt-BR)": "pt-BR-ThalitaMultilingualNeural",
-    "Raquel (pt-PT)": "pt-PT-RaquelNeural",
-    "Ava Multilingual (en-US)": "en-US-AvaMultilingualNeural",
-    "Emma Multilingual (en-US)": "en-US-EmmaMultilingualNeural",
 }
 DEFAULT_HOTWORDS = "Francisca, Francisca Neural, AURELIA"
 SAMPLE_RATE = 16000
@@ -109,7 +106,7 @@ class VoiceChanger:
 
         ttk.Label(
             outer,
-            text="Thalita é pt-BR; Raquel é pt-PT. Ava e Emma são multilíngues en-US e podem soar com sotaque diferente. Para chamadas, escolha CABLE Input aqui e CABLE Output no app da chamada.",
+            text="A transcrição é fixada em português. As duas vozes disponíveis são pt-BR. Para chamadas, escolha CABLE Input aqui e CABLE Output no app da chamada.",
             style="Muted.TLabel", wraplength=650,
         ).pack(anchor="w", pady=(0, 16))
 

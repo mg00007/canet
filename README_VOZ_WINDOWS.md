@@ -2,9 +2,9 @@
 
 Aplicativo desktop para Windows 10/11 x64. No modo ao vivo, ele escuta continuamente, detecta pausas curtas, transcreve cada frase em português localmente com Whisper Base e a sintetiza com a voz escolhida. O glossário editável ajuda a reconhecer nomes próprios. O modelo é preparado ao abrir o programa; a primeira execução pode baixar cerca de 145 MB.
 
-O seletor inclui `pt-BR-FranciscaNeural`, `pt-BR-ThalitaMultilingualNeural`, `pt-PT-RaquelNeural`, `en-US-AvaMultilingualNeural` e `en-US-EmmaMultilingualNeural`. Thalita e Francisca são pt-BR; Raquel é pt-PT; Ava e Emma são multilíngues en-US e podem pronunciar português com outro sotaque.
+O seletor inclui somente `pt-BR-FranciscaNeural` e `pt-BR-ThalitaMultilingualNeural`. O idioma de reconhecimento fica fixado em português; vozes de outros locales não aparecem no seletor.
 
-Cada frase começa a ser sintetizada após uma pausa de 0,30 s. Em testes com voz neural limpa, uma frase curta levou 1,82 s para transcrever e 0,85 s para sintetizar; uma fala de 12 s levou de 2,42 a 4,23 s para transcrever. Esses valores variam com o PC e a conexão, e ruído ou pronúncia podem causar erros. O vocabulário direcionado ajuda com “Francisca” e “AURELIA”, mas nenhum reconhecedor automático garante ortografia perfeita ou atraso máximo em qualquer situação. A transcrição roda no computador. Somente o texto reconhecido é enviado ao Microsoft Edge TTS; o áudio original do microfone não é enviado ao serviço de voz.
+Cada frase começa a ser sintetizada após uma pausa de 0,30 s. Em testes com voz neural limpa, uma frase curta levou 1,82 s para transcrever e 0,85 s para sintetizar; uma fala de 12 s levou de 2,42 a 4,23 s para transcrever. Esses valores variam com o PC e a conexão, e ruído ou pronúncia podem causar erros. O vocabulário editável ajuda com nomes próprios, mas nenhum reconhecedor automático garante ortografia perfeita. A transcrição roda no computador. Somente o texto reconhecido é enviado ao Microsoft Edge TTS; o áudio original do microfone não é enviado ao serviço de voz.
 
 ## Gerar o executável
 
