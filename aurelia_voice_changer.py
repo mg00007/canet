@@ -299,7 +299,12 @@ class VoiceChanger:
                 try:
                     self.events.put(("live_status", "Reconhecendo a frase…"))
                     segments, _ = self._get_model().transcribe(
-                        audio, language="pt", vad_filter=True, beam_size=1, condition_on_previous_text=False
+                        audio,
+                        language="pt",
+                        vad_filter=True,
+                        beam_size=1,
+                        condition_on_previous_text=False,
+                        hotwords="Francisca, Francisca Neural, AURELIA",
                     )
                     text = " ".join(segment.text.strip() for segment in segments).strip()
                     if not text:
@@ -318,7 +323,7 @@ class VoiceChanger:
     def _get_model(self):
         with self.model_lock:
             if self.model is None:
-                self.model = WhisperModel("tiny", device="cpu", compute_type="int8")
+                self.model = WhisperModel("base", device="cpu", compute_type="int8")
             return self.model
 
     def _warm_model(self):
