@@ -1,8 +1,8 @@
 # AURELIA Voz para Windows
 
-Aplicativo desktop para Windows 10/11 x64. No modo ao vivo, ele escuta continuamente, detecta pausas curtas, transcreve cada frase em português localmente com Whisper e a sintetiza com a voz neural `pt-BR-FranciscaNeural` usada no comercial.
+Aplicativo desktop para Windows 10/11 x64. No modo ao vivo, ele escuta continuamente, detecta pausas curtas, transcreve cada frase em português localmente com Whisper Tiny e a sintetiza com a mesma voz neural `pt-BR-FranciscaNeural` usada no comercial. O modelo é preparado ao abrir o programa; a primeira execução pode baixar cerca de 75 MB.
 
-Isto não é conversão instantânea timbre-a-timbre. Cada frase só começa a ser sintetizada após uma pausa curta; a transcrição local, a geração neural e a conexão à internet acrescentam atraso, que pode chegar a alguns segundos. A transcrição roda no computador. Somente o texto reconhecido é enviado ao Microsoft Edge TTS; o áudio original do microfone não é enviado ao serviço de voz.
+Cada frase começa a ser sintetizada após uma pausa de 0,30 s. Em um teste local, o ciclo de reconhecimento e síntese levou aproximadamente 1,7 s após a pausa. Esse tempo varia com o processador e a conexão ao Microsoft Edge TTS; não é possível garantir um limite rígido de 2 s pela internet. Whisper Tiny prioriza velocidade e pode errar algumas palavras. A transcrição roda no computador. Somente o texto reconhecido é enviado ao Microsoft Edge TTS; o áudio original do microfone não é enviado ao serviço de voz.
 
 ## Gerar o executável
 
@@ -10,7 +10,7 @@ Isto não é conversão instantânea timbre-a-timbre. Cada frase só começa a s
 2. Execute `build_windows.bat`.
 3. O executável será criado em `dist\AURELIA_Voice\AURELIA_Voice.exe`; o pacote portátil ficará em `AURELIA_Voice_Windows.zip`.
 
-O primeiro build precisa de internet para instalar os pacotes. Na primeira transcrição, o Whisper baixa o modelo de reconhecimento; a primeira síntese também precisa de internet.
+O primeiro build precisa de internet para instalar os pacotes. Na primeira execução, o Whisper baixa o modelo de reconhecimento; a síntese também precisa de internet.
 
 ## Usar como microfone em chamadas
 

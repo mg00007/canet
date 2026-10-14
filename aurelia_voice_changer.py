@@ -1,15 +1,13 @@
 import asyncio
-import os
+import io
 import queue
-import subprocess
-import tempfile
 import threading
 import time
 import tkinter as tk
 from tkinter import ttk
 
+import av
 import edge_tts
-import imageio_ffmpeg
 import numpy as np
 import sounddevice as sd
 from faster_whisper import WhisperModel
@@ -18,7 +16,7 @@ from faster_whisper import WhisperModel
 VOICE = "pt-BR-FranciscaNeural"
 SAMPLE_RATE = 16000
 OUTPUT_RATE = 24000
-LIVE_PAUSE_SECONDS = 0.45
+LIVE_PAUSE_SECONDS = 0.30
 LIVE_MAX_SEGMENT_SECONDS = 8
 
 
@@ -32,6 +30,7 @@ class VoiceChanger:
 
         self.events = queue.Queue()
         self.model = None
+        self.model_lock = threading.Lock()
         self.stream = None
         self.live_input_queue = None
         self.live_phrase_queue = None
@@ -47,6 +46,9 @@ class VoiceChanger:
         self.refresh_devices()
         self.root.protocol("WM_DELETE_WINDOW", self.close)
         self.root.after(100, self._poll_events)
+        self.record_button.configure(state="disabled")
+        self.status_var.set("Preparando reconhecimento de voz local…")
+        threading.Thread(target=self._warm_model, daemon=True).start()
 
     def _configure_style(self):
         style = ttk.Style()
@@ -296,9 +298,7 @@ class VoiceChanger:
                     break
                 try:
                     self.events.put(("live_status", "Reconhecendo a frase…"))
-                    if self.model is None:
-                        self.model = WhisperModel("base", device="cpu", compute_type="int8")
-                    segments, _ = self.model.transcribe(
+                    segments, _ = self._get_model().transcribe(
                         audio, language="pt", vad_filter=True, beam_size=1, condition_on_previous_text=False
                     )
                     text = " ".join(segment.text.strip() for segment in segments).strip()
@@ -314,6 +314,19 @@ class VoiceChanger:
                     self.events.put(("live_error", f"Falha nesta frase; a escuta continua: {error}"))
         finally:
             self.events.put(("live_finished", None))
+
+    def _get_model(self):
+        with self.model_lock:
+            if self.model is None:
+                self.model = WhisperModel("tiny", device="cpu", compute_type="int8")
+            return self.model
+
+    def _warm_model(self):
+        try:
+            self._get_model()
+            self.events.put(("model_ready", None))
+        except Exception as error:
+            self.events.put(("model_error", f"Não foi possível preparar o reconhecimento: {error}"))
 
     def generate_voice(self):
         if self.busy or self.recording:
@@ -343,24 +356,29 @@ class VoiceChanger:
             self.events.put(("error", f"Falha ao gerar ou reproduzir a voz: {error}"))
 
     def _create_speech_samples(self, text):
-        mp3_path = None
-        try:
-            with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as temporary:
-                mp3_path = temporary.name
+        async def generate_audio():
+            chunks = []
             speech = edge_tts.Communicate(text, VOICE, rate="-8%", pitch="-1Hz")
-            asyncio.run(speech.save(mp3_path))
-            decoded = subprocess.run(
-                [imageio_ffmpeg.get_ffmpeg_exe(), "-hide_banner", "-loglevel", "error", "-i", mp3_path,
-                 "-f", "f32le", "-ac", "1", "-ar", str(OUTPUT_RATE), "pipe:1"],
-                check=True, capture_output=True,
-            )
-            audio = np.frombuffer(decoded.stdout, dtype=np.float32).copy()
-            if not audio.size:
-                raise RuntimeError("O serviço de voz retornou áudio vazio.")
-            return audio
-        finally:
-            if mp3_path and os.path.exists(mp3_path):
-                os.unlink(mp3_path)
+            async for message in speech.stream():
+                if message["type"] == "audio":
+                    chunks.append(message["data"])
+            return b"".join(chunks)
+
+        encoded_audio = asyncio.run(generate_audio())
+        if not encoded_audio:
+            raise RuntimeError("O serviço de voz retornou áudio vazio.")
+
+        samples = []
+        with av.open(io.BytesIO(encoded_audio)) as container:
+            resampler = av.AudioResampler(format="flt", layout="mono", rate=OUTPUT_RATE)
+            for frame in container.decode(audio=0):
+                for converted in resampler.resample(frame):
+                    samples.append(converted.to_ndarray().reshape(-1))
+            for converted in resampler.resample(None):
+                samples.append(converted.to_ndarray().reshape(-1))
+        if not samples:
+            raise RuntimeError("Não foi possível decodificar o áudio sintetizado.")
+        return np.concatenate(samples).astype(np.float32, copy=False)
 
     def _poll_events(self):
         try:
@@ -375,6 +393,12 @@ class VoiceChanger:
                     self.transcript.insert("end", value + "\n")
                     self.transcript.see("end")
                 elif event == "live_error":
+                    self.status_var.set(value)
+                elif event == "model_ready":
+                    self.record_button.configure(state="normal")
+                    self.status_var.set("Reconhecimento pronto. Selecione o microfone e a saída de voz.")
+                elif event == "model_error":
+                    self.record_button.configure(state="normal")
                     self.status_var.set(value)
                 elif event == "live_finished":
                     self.timer_var.set("Fale normalmente; frases são convertidas após uma pausa curta")
